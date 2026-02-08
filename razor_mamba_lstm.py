@@ -72,10 +72,7 @@ class DualRazorNorm(nn.Module):
             normalized = self.ln_denoiser(x_denoiser)
             if self.proj_denoiser is not None:
                 normalized = self.proj_denoiser(normalized)
-            if i < 80:
-                output = (1.1 - self.W1) * normalized + (0.5 - self.W2) * x_main
-            else:
-                output = (1.5 - self.W1) * normalized + (0.5 - self.W2) * x_main
+            output = (1.1 - self.W1) * normalized + (0.5 - self.W2) * x_main
             if self.output_scale_1 is not None:
                 output = output * self.output_scale_1
 
