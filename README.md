@@ -143,6 +143,16 @@ model = TransformerSSMDenoise(
 )
 ```
 
+## Troubleshooting
+
+**Installing mamba-ssm:** Pre-built wheels for `mamba-ssm` often fail or produce broken installs. If you get import errors, build from source:
+
+```bash
+pip install --no-build-isolation mamba-ssm[causal-conv1d]
+pip uninstall mamba-ssm[causal-conv1d]
+pip install --no-cache-dir --no-binary :all: --no-build-isolation mamba-ssm[causal-conv1d]
+```
+
 ## Citation
 
 ```bibtex
