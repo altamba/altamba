@@ -50,6 +50,18 @@ A smaller 418M parameter demo using Mamba-1 (selective scan) for the dual-path S
 
 Mamba-1's original selective mechanism with input-dependent B, C, and full `d_inner`-dimensional dt provides greater expressiveness for the denoising role compared to Mamba-2's structured state space duality (SSD).
 
+### DualRazorNorm differences
+
+The two demos use different Razor constants and output scale initializations:
+
+| | 1.78B | 418M |
+|---|---|---|
+| Even layer (Post-LN) | `(1.4 - W1) * LN(denoiser) + (0.6 - W2) * main` | `(1.0 - W1) * LN(denoiser) + (1.0 - W2) * main` |
+| Odd layer (Pre-LN) | `(1.1 - W1) * LN(denoiser) + (0.5 - W2) * main` | `(1.5 - W1) * LN(denoiser) + (0.5 - W2) * main` |
+| Output scale init | `+1.5` (even) / `-1.0` (odd) | `+1.0` (even) / `+1.0` (odd) |
+
+The 1.78B demo uses asymmetric constants and phase-alternating output scaling (+1.5x / -1.0x) tuned for Mamba-2. The 418M demo uses symmetric constants with neutral output scaling, which pairs better with Mamba-1's selective scan.
+
 ## Files
 
 Each demo directory contains the same four files:
