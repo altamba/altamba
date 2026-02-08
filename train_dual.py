@@ -17,7 +17,6 @@ import os
 import glob
 import tiktoken
 from transformer_ssm_denoise import TransformerSSMDenoise
-from interference_losses import compute_interference_losses
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 # Get script directory
@@ -79,39 +78,6 @@ checkpoint_dir_baseline = os.path.join(script_dir, "checkpoints_baseline")
 checkpoint_dir_denoising = os.path.join(script_dir, "checkpoints_denoising")
 os.makedirs(checkpoint_dir_baseline, exist_ok=True)
 os.makedirs(checkpoint_dir_denoising, exist_ok=True)
-
-# =============================================================================
-# Interference Loss Configuration (for denoising model only)
-# =============================================================================
-# Enable physics-inspired auxiliary losses to explicitly encourage
-# wave interference mechanics
-USE_INTERFERENCE_LOSSES = False  # Testing reversed config without auxiliary losses first
-
-INTERFERENCE_CONFIG = {
-    # ANC Loss: Force SSM to match Transformer on wrong predictions
-    "use_anc": False,
-    "alpha": 0.1,
-
-    # Orthogonality: Penalize correlation between paths
-    "use_ortho": False,
-    "beta": 0.01,
-
-    # Energy: Minimize combined output on non-targets
-    "use_energy": False,
-    "gamma": 0.001,
-
-    # Spectral: Force SSM to low freq, Transformer to high freq
-    "use_spectral": False,
-    "delta": 0.001,
-
-    # Phase: Encourage 180° phase difference
-    "use_phase": False,
-    "epsilon": 0.01,
-
-    # Kurtosis: Sharpen output distribution
-    "use_kurtosis": False,
-    "zeta": 0.001,
-}
 
 torch.manual_seed(1337)
 
@@ -367,52 +333,11 @@ def estimate_loss(model, dataset, global_step):
     return out
 
 
-def forward_with_intermediates(model, x):
-    """
-    Modified forward pass that returns intermediate states for interference losses.
-
-    Returns:
-        logits_final, logits_trans, logits_ssm, hidden_trans, hidden_ssm, razor_output
-    """
-    batch_size, seq_len = x.shape
-    model_inner = model.model  # Access TransformerSSMDenoise inside TransformerModel
-
-    # Embed
-    h = model_inner.embedding(x) + model_inner.pos_embedding[:, :seq_len, :]
-    h = model_inner.dropout(h)
-
-    # Causal mask
-    causal_mask = torch.triu(
-        torch.ones(seq_len, seq_len, device=x.device) * float('-inf'),
-        diagonal=1
-    )
-
-    # Process through layers
-    for i in range(model_inner.n_layers):
-        h_trans = model_inner.transformer_layers[i](h, mask=causal_mask)
-        h_ssm = model_inner.ssm_layers[i](h)
-        h = model_inner.blend_layers[i](h_trans, h_ssm)
-
-        # Save last layer intermediate states
-        if i == model_inner.n_layers - 1:
-            hidden_trans = h_trans
-            hidden_ssm = h_ssm
-            razor_output = h
-
-    # Project to vocab
-    logits_trans = model_inner.fc_out(model_inner.ln_f(hidden_trans))
-    logits_ssm = model_inner.fc_out(model_inner.ln_f(hidden_ssm))
-    logits_final = model_inner.fc_out(model_inner.ln_f(razor_output))
-
-    return logits_final, logits_trans, logits_ssm, hidden_trans, hidden_ssm, razor_output
-
-
 def save_checkpoint(model, optimizer, scaler, step, loss, filename):
     """Save model checkpoint."""
     checkpoint = {
         'step': step,
         'model_state_dict': model.state_dict(),
-        #'optimizer_state_dict': optimizer.state_dict(),
         'scaler_state_dict': scaler.state_dict() if scaler else None,
         'loss': loss,
     }
@@ -430,13 +355,6 @@ if __name__ == "__main__":
     print(f"  n_heads: {n_heads}")
     print(f"  batch_size: {batch_size} (effective: {batch_size * gradient_accumulation_steps})")
     print(f"  baseline_type: {baseline_type.upper()}")
-
-    if USE_INTERFERENCE_LOSSES:
-        print(f"\n  Interference Losses: ENABLED")
-        enabled_losses = [k.replace('use_', '').upper() for k, v in INTERFERENCE_CONFIG.items() if k.startswith('use_') and v]
-        print(f"  Active: {', '.join(enabled_losses)}")
-    else:
-        print(f"\n  Interference Losses: DISABLED")
 
     # Load dataset
     print("\n" + "="*80)
@@ -588,10 +506,6 @@ if __name__ == "__main__":
             # Save best models
             if losses_baseline['val'] < best_val_baseline:
                 best_val_baseline = losses_baseline['val']
-                #if save_checkpoints:
-                    #save_checkpoint(model_baseline, optimizer_baseline, scaler_baseline,
-                    #              step, best_val_baseline,
-                    #              os.path.join(checkpoint_dir_baseline, "best_model.pt"))
 
             if losses_denoising['val'] < best_val_denoising:
                 best_val_denoising = losses_denoising['val']
@@ -627,57 +541,17 @@ if __name__ == "__main__":
             torch.nn.utils.clip_grad_norm_(model_baseline.parameters(), 1.0)
             optimizer_baseline.step()
 
-        # Train DENOISING (with optional interference losses)
+        # Train DENOISING
         optimizer_denoising.zero_grad()
         for _ in range(gradient_accumulation_steps):
             X_batch, Y_batch = dataset.get_batch('train', batch_size, step)
             if use_amp:
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    if USE_INTERFERENCE_LOSSES:
-                        # Forward with intermediates for interference losses
-                        logits_final, logits_trans, logits_ssm, hidden_trans, hidden_ssm, razor_output = \
-                            forward_with_intermediates(model_denoising, X_batch)
-
-                        # Cross-entropy loss
-                        ce_loss = F.cross_entropy(
-                            logits_final.view(-1, logits_final.size(-1)),
-                            Y_batch.view(-1)
-                        )
-
-                        # Interference losses
-                        interference_loss, loss_dict = compute_interference_losses(
-                            logits_trans, logits_ssm, logits_final,
-                            hidden_trans, hidden_ssm, razor_output,
-                            Y_batch, INTERFERENCE_CONFIG
-                        )
-
-                        loss = ce_loss + interference_loss
-                    else:
-                        # Standard forward (CE loss only)
-                        _, loss = model_denoising(X_batch, Y_batch)
-
+                    _, loss = model_denoising(X_batch, Y_batch)
                 loss = loss / gradient_accumulation_steps
                 scaler_denoising.scale(loss).backward()
             else:
-                if USE_INTERFERENCE_LOSSES:
-                    logits_final, logits_trans, logits_ssm, hidden_trans, hidden_ssm, razor_output = \
-                        forward_with_intermediates(model_denoising, X_batch)
-
-                    ce_loss = F.cross_entropy(
-                        logits_final.view(-1, logits_final.size(-1)),
-                        Y_batch.view(-1)
-                    )
-
-                    interference_loss, loss_dict = compute_interference_losses(
-                        logits_trans, logits_ssm, logits_final,
-                        hidden_trans, hidden_ssm, razor_output,
-                        Y_batch, INTERFERENCE_CONFIG
-                    )
-
-                    loss = ce_loss + interference_loss
-                else:
-                    _, loss = model_denoising(X_batch, Y_batch)
-
+                _, loss = model_denoising(X_batch, Y_batch)
                 loss = loss / gradient_accumulation_steps
                 loss.backward()
 
@@ -693,9 +567,6 @@ if __name__ == "__main__":
 
         # Periodic checkpoints
         if save_checkpoints and (step + 1) % checkpoint_interval == 0:
-            #save_checkpoint(model_baseline, optimizer_baseline, scaler_baseline,
-            #              step, losses_baseline['train'],
-            #              os.path.join(checkpoint_dir_baseline, f"checkpoint_step_{step+1}.pt"))
             save_checkpoint(model_denoising, optimizer_denoising, scaler_denoising,
                           step, losses_denoising['train'],
                           os.path.join(checkpoint_dir_denoising, f"checkpoint_step_{step+1}.pt"))

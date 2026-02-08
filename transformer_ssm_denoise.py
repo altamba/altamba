@@ -1,24 +1,14 @@
 """
-Transformer + SSM Denoising Architecture
-=========================================
+ALTAMBA: Alternating Mamba with Peristaltic Normalization
+=========================================================
 
-Tests the hypothesis: Expressive Transformer (main) + Structured SSM (denoising)
+Dual-path Transformer+SSM architecture with alternating roles per layer.
 
-Architecture:
-    input → embedding
-          ↓
-    ┌─────────────────┬─────────────────┐
-    │  Transformer    │      SSM        │
-    │  (main path)    │  (denoising)    │
-    └─────────────────┴─────────────────┘
-          ↓
-    DualRazorNorm: (1-W1)*Transformer + (1-W2)*SSM
-          ↓
-    output projection
+Even layers: SSM (main) + Transformer (denoiser, Post-LN)
+Odd layers:  Transformer (main) + Transformer (denoiser, Pre-LN)
 
-Expected initialization:
-- W1 = 0.1 → Transformer: 90% (main expressive path)
-- W2 = 1.5 → SSM: -50% (structured denoising)
+Blending via DualRazorNorm:
+    y = s * [(c - W1) * LN(x_denoiser) + (c' - W2) * x_main]
 """
 
 import math
@@ -26,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from razor_mamba_lstm import DualRazorNorm, SelectiveSSM
+from razor_mamba_lstm import DualRazorNorm
 
 # Import the bounded dt fix
 from mamba2_dt_fix import wrap_mamba2_with_bounded_dt
@@ -35,18 +25,15 @@ from mamba2_dt_fix import wrap_mamba2_with_bounded_dt
 try:
     from mamba_ssm import Mamba2
     MAMBA_NATIVE_AVAILABLE = True
-    print("   [OK] Using native mamba-ssm Mamba2 (fast CUDA kernels) with BOUNDED DT")
 except ImportError:
     try:
         from mamba_ssm import Mamba
-        Mamba2 = Mamba  # Fallback to Mamba-1 if Mamba2 not available
+        Mamba2 = Mamba
         MAMBA_NATIVE_AVAILABLE = True
-        print("   [OK] Using native mamba-ssm Mamba (Mamba-1, fast CUDA kernels) with BOUNDED DT")
     except ImportError:
         from mamba_encoder import Mamba2Core
         Mamba2 = Mamba2Core
         MAMBA_NATIVE_AVAILABLE = False
-        print("   [WARNING] Using pure PyTorch Mamba2Core (slower)")
 
 class TransformerPostBlock(nn.Module):
     """
@@ -211,10 +198,9 @@ class SSMBlock(nn.Module):
             chunk_size=ssd_chunk_size
         )
 
-        # APPLY THE FIX: Bounded sigmoid dt
+        # Apply bounded sigmoid dt fix
         if MAMBA_NATIVE_AVAILABLE:
             self.ssm = wrap_mamba2_with_bounded_dt(self.ssm, dt_min=dt_min, dt_max=dt_max)
-            print(f"   [FIXED] SSMBlock with bounded dt ∈ [{dt_min}, {dt_max}]")
 
         # Normalization - RMSNorm for brake mode (energy dissipation)
         if use_brake_mode:
@@ -240,23 +226,12 @@ class SSMBlock(nn.Module):
         Brake mode: RMSNorm dissipates energy, gain controls brake force
         Standard mode: LayerNorm on delta, direct addition
         """
-        # INPUT SURGE PROTECTION: Prevent "token 0 = 207" scenarios
-        # Tanh clamps input magnitude to prevent unstable SSM regime
-        # Scale factor 5.0 allows normal inputs through while protecting against spikes
-        #x_safe = torch.tanh(x / 5.0) * 5.0
-
-        # SSM forward pass (now protected from explosive initial states)
+        # SSM forward pass
         ssm_out = self.ssm(x)
 
         # THE BRIDGE: Normalize energy before applying to residual stream
         ssm_out = self.norm(ssm_out)
         ssm_out = self.dropout(ssm_out)
-
-        # Apply brake gain if in brake mode
-        #if self.use_brake_mode and self.brake_gain is not None:
-            # Controlled brake force - starts small (0.1), optimizer increases
-            # as it gains confidence in the bridge's stability
-            #ssm_out = self.brake_gain * ssm_out
 
         # Residual connection
         output = x + ssm_out
@@ -605,118 +580,3 @@ class CharTransformerSSM(nn.Module):
 
         return idx
 
-
-# ============================================================
-# TEST
-# ============================================================
-
-if __name__ == "__main__":
-    print("\n" + "="*80)
-    print("Transformer + SSM Denoising Architecture Test")
-    print("="*80)
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"\nDevice: {device}")
-
-    # Test configuration
-    vocab_size = 65
-    batch_size = 4
-    seq_len = 64
-    d_model = 256
-    n_layers = 2
-    n_heads = 4
-
-    print(f"\nConfiguration:")
-    print(f"  Vocab size: {vocab_size}")
-    print(f"  d_model: {d_model}")
-    print(f"  n_layers: {n_layers}")
-    print(f"  n_heads: {n_heads}")
-
-    # Create models
-    print("\n" + "-"*80)
-    print("Creating models...")
-
-    # Baseline Transformer
-    model_baseline = CharTransformerSSM(
-        vocab_size, d_model, n_layers, n_heads,
-        use_denoising=False
-    ).to(device)
-
-    # Transformer + SSM Denoising
-    model_denoise = CharTransformerSSM(
-        vocab_size, d_model, n_layers, n_heads,
-        use_denoising=True,
-        init_w1=0.1,  # Transformer: 90%
-        init_w2=1.5   # SSM: -50% (denoising)
-    ).to(device)
-
-    print("  [OK] Baseline Transformer")
-    print("  [OK] Transformer + SSM Denoising")
-
-    # Test input
-    x = torch.randint(0, vocab_size, (batch_size, seq_len)).to(device)
-    targets = torch.randint(0, vocab_size, (batch_size, seq_len)).to(device)
-
-    print("\n" + "-"*80)
-    print("Forward pass tests...")
-
-    # Test baseline
-    print("\n1. Baseline Transformer:")
-    with torch.no_grad():
-        logits_base, loss_base = model_baseline(x, targets)
-    print(f"   Input: {x.shape}")
-    print(f"   Output: {logits_base.shape}")
-    print(f"   Loss: {loss_base.item():.4f}")
-    print("   [OK] Forward pass successful")
-
-    # Test denoising
-    print("\n2. Transformer + SSM Denoising:")
-    with torch.no_grad():
-        logits_denoise, loss_denoise = model_denoise(x, targets)
-    print(f"   Input: {x.shape}")
-    print(f"   Output: {logits_denoise.shape}")
-    print(f"   Loss: {loss_denoise.item():.4f}")
-
-    # Show W values
-    weights = model_denoise.model.get_razor_weights()
-    print(f"\n   Initial W values:")
-    for layer_idx, w1, w2 in weights:
-        ssm_pct = (1 - w1) * 100
-        ssm_denoise_pct = (1 - w2) * 100
-        print(f"     Layer {layer_idx}: W1={w1:.4f}, W2={w2:.4f}")
-        print(f"       -> Transformer: {ssm_pct:.1f}%, SSM: {ssm_denoise_pct:.1f}%")
-    print("   [OK] Forward pass successful")
-
-    # Parameter counts
-    print("\n" + "-"*80)
-    print("Parameter comparison:")
-    params_base = sum(p.numel() for p in model_baseline.parameters())
-    params_denoise = sum(p.numel() for p in model_denoise.parameters())
-    print(f"  Baseline Transformer:     {params_base/1e6:.2f}M")
-    print(f"  Transformer + SSM:        {params_denoise/1e6:.2f}M")
-    print(f"  Overhead:                 +{(params_denoise-params_base)/1e6:.2f}M ({100*(params_denoise-params_base)/params_base:.1f}%)")
-
-    # Test backward
-    print("\n" + "-"*80)
-    print("Backward pass test...")
-    logits, loss = model_denoise(x, targets)
-    loss.backward()
-
-    has_nan = any(torch.isnan(p.grad).any() for p in model_denoise.parameters() if p.grad is not None)
-    has_inf = any(torch.isinf(p.grad).any() for p in model_denoise.parameters() if p.grad is not None)
-    print(f"  Gradient NaN: {has_nan}")
-    print(f"  Gradient Inf: {has_inf}")
-    print("  [OK] Backward pass successful")
-
-    # Show W gradients
-    print("\n  W parameter gradients:")
-    for i, blend in enumerate(model_denoise.model.blend_layers):
-        w1_grad = blend.W1.grad.item() if blend.W1.grad is not None else 0
-        w2_grad = blend.W2.grad.item() if blend.W2.grad is not None else 0
-        print(f"    Layer {i}: W1.grad={w1_grad:.6f}, W2.grad={w2_grad:.6f}")
-
-    print("\n" + "="*80)
-    print("All tests passed!")
-    print("="*80)
-    print("\nReady to train on Shakespeare dataset!")
-    print("="*80 + "\n")
