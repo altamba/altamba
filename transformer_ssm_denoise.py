@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from razor_mamba_lstm import DualRazorNorm
+from dual_razor_norm import DualRazorNorm
 
 # Import the bounded dt fix
 from mamba2_dt_fix import wrap_mamba2_with_bounded_dt

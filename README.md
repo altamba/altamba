@@ -27,7 +27,7 @@ Trained on Common Pile (arXiv subset) with GPT-4 tokenizer (cl100k_base).
 | File | Description |
 |------|-------------|
 | `transformer_ssm_denoise.py` | Core ALTAMBA architecture (TransformerSSMDenoise) |
-| `razor_mamba_lstm.py` | DualRazorNorm blending operation |
+| `dual_razor_norm.py` | DualRazorNorm blending operation |
 | `mamba2_dt_fix.py` | Bounded-dt fix for Mamba-2 |
 | `train_dual.py` | Training script (side-by-side baseline vs ALTAMBA) |
 | `altamba_paper.tex` | Paper source |
