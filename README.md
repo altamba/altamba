@@ -22,6 +22,10 @@ ALTAMBA is a dual-path Transformer+SSM architecture that runs both paths in para
 
 Trained on Common Pile (arXiv subset) with GPT-4 tokenizer (cl100k_base).
 
+## Model Weights
+
+Pre-trained 1.78B checkpoint (fp16): [ameritusweb/altamba-1.78b on Hugging Face](https://huggingface.co/ameritusweb/altamba-1.78b)
+
 ## Files
 
 | File | Description |
